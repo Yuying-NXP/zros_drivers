@@ -124,7 +124,7 @@ static void sense_imu_init(struct context *ctx)
 	// setup gyro devices
 	ctx->gyro_dev = get_device(DEVICE_DT_GET(DT_ALIAS(gyro0)));
 
-	k_timer_start(&ctx->timer, K_MSEC(1000), K_MSEC(5));
+	k_timer_start(&ctx->timer, K_MSEC(1000), K_MSEC(1));
 
 	k_sem_take(&ctx->running, K_FOREVER);
 	LOG_INF("init");
