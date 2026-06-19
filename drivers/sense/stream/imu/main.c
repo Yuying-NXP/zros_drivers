@@ -50,9 +50,16 @@ static const struct iir2_coeffs accel_lpf = {
 };
 
 /* Gyro LPF: fc=120 Hz, fs=800 Hz — minimal phase lag for the rate controller */
+// static const struct iir2_coeffs gyro_lpf = {
+// 	.b0 =  0.131106f, .b1 =  0.262213f, .b2 =  0.131106f,
+// 	.a1 = -0.747789f, .a2 =  0.272215f,
+// };
+
+
+/* Gyro LPF: fc=15 Hz, 2nd order for buggy */
 static const struct iir2_coeffs gyro_lpf = {
-	.b0 =  0.131106f, .b1 =  0.262213f, .b2 =  0.131106f,
-	.a1 = -0.747789f, .a2 =  0.272215f,
+	.b0 =  0.00320077, .b1 =  0.00640154, .b2 =  0.00320077,
+	.a1 = -1.83370725  , .a2 =  0.84651034,
 };
 
 struct iir2_state {
@@ -198,6 +205,7 @@ static void feed_calibration(struct context *ctx)
 
 	ctx->calibration.bias.accel[0] = accel_mean[0];
 	ctx->calibration.bias.accel[1] = accel_mean[1];
+	// why using 0 here?
 	ctx->calibration.bias.accel[2] = 0;
 	ctx->calibration.accel_scale = accel_magnitude / ACCEL_G;
 
