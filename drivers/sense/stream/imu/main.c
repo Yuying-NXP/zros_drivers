@@ -32,7 +32,7 @@ LOG_MODULE_REGISTER(sense_imu_stream, CONFIG_ZROS_SENSE_STREAM_IMU_LOG_LEVEL);
 
 #define ACCEL_G ((float)SENSOR_G / 1000000.0f)
 
-#define IMU_STREAM_CALIBRATION_COUNT 100
+#define IMU_STREAM_CALIBRATION_COUNT 1000
 #define IMU_ALIAS(i) DT_ALIAS(_CONCAT(imu_stream_,i))
 
 /*
@@ -205,7 +205,6 @@ static void feed_calibration(struct context *ctx)
 
 	ctx->calibration.bias.accel[0] = accel_mean[0];
 	ctx->calibration.bias.accel[1] = accel_mean[1];
-	// why using 0 here?
 	ctx->calibration.bias.accel[2] = 0;
 	ctx->calibration.accel_scale = accel_magnitude / ACCEL_G;
 
