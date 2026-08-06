@@ -32,7 +32,7 @@ LOG_MODULE_REGISTER(sense_imu_stream, CONFIG_ZROS_SENSE_STREAM_IMU_LOG_LEVEL);
 
 #define ACCEL_G ((float)SENSOR_G / 1000000.0f)
 
-#define IMU_STREAM_CALIBRATION_COUNT 1000
+#define IMU_STREAM_CALIBRATION_COUNT 5000
 #define IMU_ALIAS(i) DT_ALIAS(_CONCAT(imu_stream_,i))
 
 /*
@@ -86,6 +86,12 @@ enum sense_imu_stream_calibration_st {
 	SENSE_IMU_STREAM_CALIBRATED,
 };
 
+struct online_stats{
+	size_t count;
+	float mean;
+	float m2;
+};
+
 struct context {
 	const char *name;
 	struct zros_node node;
@@ -100,9 +106,9 @@ struct context {
 		enum sense_imu_stream_calibration_st state;
 		float accel_scale;
 		struct {
-			float accel[IMU_STREAM_CALIBRATION_COUNT][3];
-			float gyro[IMU_STREAM_CALIBRATION_COUNT][3];
-		} samples;
+			struct online_stats accel[3];
+			struct online_stats gyro[3];
+		} stats;
 		struct {
 			float accel[3];
 			float gyro[3];
@@ -123,6 +129,38 @@ struct context {
 	} stream;
 };
 
+// inline: only expands during compilation
+static inline void online_stats_update(struct online_stats *stats, float sample)
+{
+	stats->count++;
+	
+	float delta = sample - stats->mean;					/* x_(N+1) - mu_N */
+	stats->mean += delta/(float)stats->count;		    /* stats->mean is now mu_(N+1) */
+	float delta2 = sample - stats->mean;				/* x_(N+1) - mu_(N+1) */
+	stats->m2 += delta*delta2;							/* M2_(N+1) = M2_N + (x_(N+1) - mu_N)*x_(N+1) - mu_(N+1) */
+
+}
+
+static inline void online_stats_reset(struct online_stats *stats)
+{
+	stats->count = 0;
+	stats->mean = 0.0f;
+	stats->m2 = 0.0f;
+}
+
+static inline float online_stats_stddev(struct online_stats *stats){
+	if (stats->count == 0){
+		return 0.0f;
+	}
+
+	float variance = stats->m2 / (float)stats->count;
+
+	// protect against a tiny negative value from floating-point rounding
+	variance = fmaxf(variance, 0.0f);
+
+	return sqrtf(variance);
+}
+
 static void filter_init(struct context *ctx)
 {
 	memset(&ctx->filter, 0, sizeof(ctx->filter));
@@ -134,15 +172,25 @@ static void feed_calibration(struct context *ctx)
 	if (ctx->calibration.state != SENSE_IMU_STREAM_CALIBRATING) {
 		memset(&ctx->calibration.bias, 0, sizeof(ctx->calibration.bias));
 		ctx->calibration.count = 0;
+
+		for (int i = 0; i < 3; i++){
+			online_stats_reset(&ctx->calibration.stats.accel[i]);
+			online_stats_reset(&ctx->calibration.stats.gyro[i]);
+		}
+
 		ctx->calibration.state = SENSE_IMU_STREAM_CALIBRATING;
 	}
 
-	size_t idx = ctx->calibration.count;
-
 	for (int i = 0; i < 3; i++) {
-		ctx->calibration.samples.accel[idx][i] = ctx->filtered.accel[i];
-		ctx->calibration.samples.gyro[idx][i] = ctx->filtered.gyro[i];
+		online_stats_update(
+			&ctx->calibration.stats.accel[i],
+			ctx->filtered.accel[i]);
+
+		online_stats_update(
+			&ctx->calibration.stats.gyro[i],
+			ctx->filtered.gyro[i]);
 	}
+
 	ctx->calibration.count++;
 
 	if (ctx->calibration.count < IMU_STREAM_CALIBRATION_COUNT) {
@@ -154,28 +202,13 @@ static void feed_calibration(struct context *ctx)
 	float accel_std[3] = {0};
 	float gyro_std[3] = {0};
 	bool calibration_ok = true;
-	const float inv_count = 1.0f / IMU_STREAM_CALIBRATION_COUNT;
 
-	for (size_t i = 0; i < IMU_STREAM_CALIBRATION_COUNT; i++) {
-		for (int j = 0; j < 3; j++) {
-			accel_mean[j] += ctx->calibration.samples.accel[i][j] * inv_count;
-			gyro_mean[j] += ctx->calibration.samples.gyro[i][j] * inv_count;
-		}
-	}
+	for (size_t i = 0; i < 3; i++) {
+			accel_mean[i] = ctx->calibration.stats.accel[i].mean;
+			gyro_mean[i] = ctx->calibration.stats.gyro[i].mean;
 
-	for (size_t i = 0; i < IMU_STREAM_CALIBRATION_COUNT; i++) {
-		for (int j = 0; j < 3; j++) {
-			float ea = ctx->calibration.samples.accel[i][j] - accel_mean[j];
-			float eg = ctx->calibration.samples.gyro[i][j] - gyro_mean[j];
-
-			accel_std[j] += ea * ea;
-			gyro_std[j] += eg * eg;
-		}
-	}
-
-	for (int i = 0; i < 3; i++) {
-		accel_std[i] = sqrtf(accel_std[i] * inv_count);
-		gyro_std[i] = sqrtf(gyro_std[i] * inv_count);
+			accel_std[i] = online_stats_stddev(&ctx->calibration.stats.accel[i]);
+			gyro_std[i] = online_stats_stddev(&ctx->calibration.stats.gyro[i]);
 	}
 
 	float accel_magnitude = sqrtf(accel_mean[0] * accel_mean[0] +
@@ -210,10 +243,10 @@ static void feed_calibration(struct context *ctx)
 
 	LOG_INF("%s: Calibration completed (scale=%.3f)", ctx->name,
 		(double)ctx->calibration.accel_scale);
-	LOG_DBG("%s: accel mean: %7.4f %7.4f %7.4f std: %7.4f %7.4f %7.4f", ctx->name,
+	LOG_INF("%s: accel mean: %7.4f %7.4f %7.4f std: %7.4f %7.4f %7.4f", ctx->name,
 		(double)accel_mean[0], (double)accel_mean[1], (double)accel_mean[2],
 		(double)accel_std[0], (double)accel_std[1], (double)accel_std[2]);
-	LOG_DBG("%s: gyro  mean: %7.4f %7.4f %7.4f std: %7.4f %7.4f %7.4f", ctx->name,
+	LOG_INF("%s: gyro  mean: %7.4f %7.4f %7.4f std: %7.4f %7.4f %7.4f", ctx->name,
 		(double)gyro_mean[0], (double)gyro_mean[1], (double)gyro_mean[2],
 		(double)gyro_std[0], (double)gyro_std[1], (double)gyro_std[2]);
 
