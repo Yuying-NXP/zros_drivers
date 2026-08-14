@@ -32,7 +32,9 @@ LOG_MODULE_REGISTER(sense_imu_stream, CONFIG_ZROS_SENSE_STREAM_IMU_LOG_LEVEL);
 
 #define ACCEL_G ((float)SENSOR_G / 1000000.0f)
 
-#define IMU_STREAM_CALIBRATION_COUNT 5000
+#define IMU_STREAM_CALIBRATION_COUNT 1
+#define IMU_CSV_PUBLISH_PERIOD 100      // 100ms, 10hz
+
 #define IMU_ALIAS(i) DT_ALIAS(_CONCAT(imu_stream_,i))
 
 /*
@@ -127,7 +129,64 @@ struct context {
 		struct rtio *ctx;
 		struct rtio_iodev *iodev;
 	} stream;
+	struct {
+		struct online_stats gyro_z;
+		float latest_gyro_z_raw;
+		int64_t start_time;
+		int64_t last_time_csv_printed;
+		bool header_printed;
+		bool initialized;
+	} measurement;
+	struct {
+		float accel[3];
+		float gyro[3];
+	} raw;
 };
+
+static void print_to_csv(struct context *ctx){
+	
+	int64_t now_ms = k_uptime_get();
+
+	// nothing to print until one gyro sample is decoded
+	if (ctx->measurement.gyro_z.count == 0){
+		return;
+	}
+
+	// initialize
+	if (!ctx->measurement.initialized){
+		ctx->measurement.start_time = now_ms;
+		ctx->measurement.last_time_csv_printed = now_ms;
+		ctx->measurement.initialized = true;
+	}
+
+	// print header
+	if (!ctx->measurement.header_printed){
+		printk("imu, time_ms,gyro_z_raw, gyro_z_average, sample_count\n");
+		ctx->measurement.header_printed = true;
+	}
+
+	// counting keeps but only publish 10hz
+	if ((now_ms - ctx->measurement.last_time_csv_printed) < IMU_CSV_PUBLISH_PERIOD){
+		return;
+	}
+
+	int64_t elapsed_ms = now_ms - ctx->measurement.start_time;
+
+	// convert gyro_z only
+	// double gyro_value_z = ctx->raw.gyro[2];
+	// ctx->measurement.gyro_sum += gyro_value_z;
+	// ctx->measurement.gyro_z.count++;
+	// ctx->measurement.gyro_average = ctx->measurement.gyro_sum / (double)ctx->measurement.gyro_z.count;
+
+	printk("%s, %lld, %.9f, %.9f, %llu\n",
+			ctx->name,
+			(long long)elapsed_ms,
+			(double)ctx->measurement.latest_gyro_z_raw,
+			(double)ctx->measurement.gyro_z.mean,
+			(unsigned long long)ctx->measurement.gyro_z.count);
+
+	ctx->measurement.last_time_csv_printed = now_ms;
+}
 
 // inline: only expands during compilation
 static inline void online_stats_update(struct online_stats *stats, float sample)
@@ -159,6 +218,16 @@ static inline float online_stats_stddev(struct online_stats *stats){
 	variance = fmaxf(variance, 0.0f);
 
 	return sqrtf(variance);
+}
+
+static void measurement_init(struct context *ctx){
+	online_stats_reset(&ctx->measurement.gyro_z);
+
+	ctx->measurement.latest_gyro_z_raw = 0.0f;
+	ctx->measurement.start_time = 0;
+	ctx->measurement.last_time_csv_printed = 0;
+	ctx->measurement.initialized = false;
+	ctx->measurement.header_printed = false;	
 }
 
 static void filter_init(struct context *ctx)
@@ -332,32 +401,52 @@ static int decode_and_filter(struct context *ctx, uint8_t *buf)
 			for (int i = 0; i < 3; i++) {
 				float sample = Z_SHIFT_Q31_TO_F32(
 					data->readings[f].values[i], data->shift);
+
+				ctx->raw.gyro[i] = sample;
+				
 				ctx->filtered.gyro[i] = iir2_update(
 					&ctx->filter.gyro[i], &gyro_lpf, sample);
 			}
+			ctx->measurement.latest_gyro_z_raw = ctx->raw.gyro[2];
+			online_stats_update(&ctx->measurement.gyro_z, ctx->raw.gyro[2]);
 		}
 	}
 
 	return 0;
 }
 
+// static void imu_publish(struct context *ctx)
+// {
+// 	float inv_scale = 1.0f / ctx->calibration.accel_scale;
+
+// 	stamp_msg(&ctx->imu.stamp, k_uptime_ticks());
+// 	ctx->imu.linear_acceleration.x =
+// 		(double)((ctx->filtered.accel[0] - ctx->calibration.bias.accel[0]) * inv_scale);
+// 	ctx->imu.linear_acceleration.y =
+// 		(double)((ctx->filtered.accel[1] - ctx->calibration.bias.accel[1]) * inv_scale);
+// 	ctx->imu.linear_acceleration.z =
+// 		(double)((ctx->filtered.accel[2] - ctx->calibration.bias.accel[2]) * inv_scale);
+// 	ctx->imu.angular_velocity.x =
+// 		(double)(ctx->filtered.gyro[0] - ctx->calibration.bias.gyro[0]);
+// 	ctx->imu.angular_velocity.y =
+// 		(double)(ctx->filtered.gyro[1] - ctx->calibration.bias.gyro[1]);
+// 	ctx->imu.angular_velocity.z =
+// 		(double)(ctx->filtered.gyro[2] - ctx->calibration.bias.gyro[2]);
+
+// 	zros_pub_update(&ctx->pub_imu);
+// }
+
+// publish raw data only
 static void imu_publish(struct context *ctx)
 {
-	float inv_scale = 1.0f / ctx->calibration.accel_scale;
-
 	stamp_msg(&ctx->imu.stamp, k_uptime_ticks());
-	ctx->imu.linear_acceleration.x =
-		(double)((ctx->filtered.accel[0] - ctx->calibration.bias.accel[0]) * inv_scale);
-	ctx->imu.linear_acceleration.y =
-		(double)((ctx->filtered.accel[1] - ctx->calibration.bias.accel[1]) * inv_scale);
-	ctx->imu.linear_acceleration.z =
-		(double)((ctx->filtered.accel[2] - ctx->calibration.bias.accel[2]) * inv_scale);
-	ctx->imu.angular_velocity.x =
-		(double)(ctx->filtered.gyro[0] - ctx->calibration.bias.gyro[0]);
-	ctx->imu.angular_velocity.y =
-		(double)(ctx->filtered.gyro[1] - ctx->calibration.bias.gyro[1]);
-	ctx->imu.angular_velocity.z =
-		(double)(ctx->filtered.gyro[2] - ctx->calibration.bias.gyro[2]);
+	ctx->imu.linear_acceleration.x = ctx->raw.accel[0];
+	ctx->imu.linear_acceleration.y = ctx->raw.accel[1];
+	ctx->imu.linear_acceleration.z = ctx->raw.accel[2];
+
+	ctx->imu.angular_velocity.x = ctx->raw.gyro[0];
+	ctx->imu.angular_velocity.y = ctx->raw.gyro[1];
+	ctx->imu.angular_velocity.z = ctx->raw.gyro[2];
 
 	zros_pub_update(&ctx->pub_imu);
 }
@@ -392,10 +481,12 @@ static void process_events(int result, uint8_t *buf, uint32_t len, void *userdat
 		zros_sub_update(&ctx->sub_status);
 	}
 
-	if (calibration_requested(ctx) || ctx->calibration.state != SENSE_IMU_STREAM_CALIBRATED) {
-		feed_calibration(ctx);
-		return;
-	}
+	// if (calibration_requested(ctx) || ctx->calibration.state != SENSE_IMU_STREAM_CALIBRATED) {
+	// 	feed_calibration(ctx);
+	// 	return;
+	// }
+
+	print_to_csv(ctx);
 
 	imu_publish(ctx);
 }
@@ -453,6 +544,8 @@ static void imu_stream_thread(void *arg0)
 	zros_pub_init(&ctx->pub_imu, &ctx->node, ctx->pub_topic, &ctx->imu);
 	zros_sub_init(&ctx->sub_status, &ctx->node, &topic_status, &ctx->status, 1);
 	filter_init(ctx);
+
+	measurement_init(ctx);
 
 	err = setup_stream(ctx);
 	__ASSERT(!err, "Failed to start stream for %p", ctx->stream.iodev);
